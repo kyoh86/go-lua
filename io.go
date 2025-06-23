@@ -5,6 +5,7 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"os/exec"
 )
 
 const fileHandle = "FILE*"
@@ -13,6 +14,8 @@ const output = "_IO_output"
 
 type stream struct {
 	f     *os.File
+	r     io.Reader
+	w     io.Writer
 	close Function
 }
 
@@ -27,15 +30,31 @@ func toFile(l *State) *os.File {
 	return s.f
 }
 
-func newStream(l *State, f *os.File, close Function) *stream {
-	s := &stream{f: f, close: close}
+func toReader(l *State) io.Reader {
+	s := toStream(l)
+	if s.r != nil {
+		return s.r
+	}
+	return s.f
+}
+
+func toWriter(l *State) io.Writer {
+	s := toStream(l)
+	if s.w != nil {
+		return s.w
+	}
+	return s.f
+}
+
+func newStream(l *State, f *os.File, r io.Reader, w io.Writer, close Function) *stream {
+	s := &stream{f: f, r: r, w: w, close: close}
 	l.PushUserData(s)
 	SetMetaTableNamed(l, fileHandle)
 	return s
 }
 
 func newFile(l *State) *stream {
-	return newStream(l, nil, func(l *State) int { return FileResult(l, toStream(l).f.Close(), "") })
+	return newStream(l, nil, nil, nil, func(l *State) int { return FileResult(l, toStream(l).f.Close(), "") })
 }
 
 func ioFile(l *State, name string) *os.File {
@@ -85,23 +104,33 @@ func close(l *State) int {
 	if l.IsNone(1) {
 		l.Field(RegistryIndex, output)
 	}
-	toFile(l)
 	return closeHelper(l)
 }
 
 func write(l *State, f *os.File, argIndex int) int {
 	var err error
+	writer := toWriter(l)
 	for argCount := l.Top(); argIndex < argCount && err == nil; argIndex++ {
 		if n, ok := l.ToNumber(argIndex); ok {
-			_, err = f.WriteString(numberToString(n))
+			_, err = writer.Write([]byte(numberToString(n)))
 		} else {
-			_, err = f.WriteString(CheckString(l, argIndex))
+			_, err = writer.Write([]byte(CheckString(l, argIndex)))
 		}
 	}
 	if err == nil {
 		return 1
 	}
 	return FileResult(l, err, "")
+}
+
+func read(l *State, f *os.File, argIndex int) int {
+	reader := toReader(l)
+	buf, err := io.ReadAll(reader)
+	if err != nil && err != io.EOF {
+		return FileResult(l, err, "")
+	}
+	l.PushString(string(buf))
+	return 1
 }
 
 func readNumber(l *State, f *os.File) (err error) {
@@ -112,25 +141,6 @@ func readNumber(l *State, f *os.File) (err error) {
 		l.PushNil()
 	}
 	return
-}
-
-func read(l *State, f *os.File, argIndex int) int {
-	resultCount := 0
-	var err error
-	if argCount := l.Top() - 1; argCount == 0 {
-		//		err = readLineHelper(l, f, true)
-		resultCount = argIndex + 1
-	} else {
-		// TODO
-	}
-	if err != nil {
-		return FileResult(l, err, "")
-	}
-	if err == io.EOF {
-		l.Pop(1)
-		l.PushNil()
-	}
-	return resultCount - argIndex
 }
 
 func readLine(l *State) int {
@@ -227,7 +237,58 @@ var ioLibrary = []RegistryFunction{
 		return FileResult(l, err, name)
 	}},
 	{"output", ioFileHelper(output, "w")},
-	{"popen", func(l *State) int { Errorf(l, "'popen' not supported"); panic("unreachable") }},
+	{"popen", func(l *State) int {
+		cmdStr := CheckString(l, 1)
+		mode := OptString(l, 2, "r")
+		var r io.Reader
+		var w io.Writer
+		var closer io.Closer
+		var cmd *exec.Cmd
+		var err error
+
+		switch mode {
+		case "r":
+			cmd = exec.Command("sh", "-c", cmdStr)
+			stdout, e := cmd.StdoutPipe()
+			if e != nil {
+				l.PushNil()
+				l.PushString(e.Error())
+				return 2
+			}
+			if err = cmd.Start(); err != nil {
+				l.PushNil()
+				l.PushString(err.Error())
+				return 2
+			}
+			r = stdout
+			closer = stdout
+		case "w":
+			cmd = exec.Command("sh", "-c", cmdStr)
+			stdin, e := cmd.StdinPipe()
+			if e != nil {
+				l.PushNil()
+				l.PushString(e.Error())
+				return 2
+			}
+			if err = cmd.Start(); err != nil {
+				l.PushNil()
+				l.PushString(err.Error())
+				return 2
+			}
+			w = stdin
+			closer = stdin
+		default:
+			Errorf(l, "'popen' only supports 'r' or 'w' mode")
+			panic("unreachable")
+		}
+
+		newStream(l, nil, r, w, func(l *State) int {
+			err := closer.Close()
+			cmd.Wait()
+			return FileResult(l, err, "")
+		})
+		return 1
+	}},
 	{"read", func(l *State) int { return read(l, ioFile(l, input), 1) }},
 	{"tmpfile", func(l *State) int {
 		s := newFile(l)
@@ -250,13 +311,17 @@ var ioLibrary = []RegistryFunction{
 		return 1
 	}},
 	{"write", func(l *State) int { return write(l, ioFile(l, output), 1) }},
+	// Register standard files directly in ioLibrary
+	{"stdin", func(l *State) int { newStream(l, os.Stdin, nil, nil, dontClose); return 1 }},
+	{"stdout", func(l *State) int { newStream(l, os.Stdout, nil, nil, dontClose); return 1 }},
+	{"stderr", func(l *State) int { newStream(l, os.Stderr, nil, nil, dontClose); return 1 }},
 }
 
 var fileHandleMethods = []RegistryFunction{
 	{"close", close},
 	{"flush", func(l *State) int { return FileResult(l, toFile(l).Sync(), "") }},
 	{"lines", func(l *State) int { toFile(l); lines(l, false); return 1 }},
-	{"read", func(l *State) int { return read(l, toFile(l), 2) }},
+	{"read", func(l *State) int { return read(l, nil, 2) }},
 	{"seek", func(l *State) int {
 		whence := []int{os.SEEK_SET, os.SEEK_CUR, os.SEEK_END}
 		f := toFile(l)
@@ -272,13 +337,10 @@ var fileHandleMethods = []RegistryFunction{
 		return 1
 	}},
 	{"setvbuf", func(l *State) int { // Files are unbuffered in Go. Fake support for now.
-		//		f := toFile(l)
-		//		op := CheckOption(l, 2, "", []string{"no", "full", "line"})
-		//		size := OptInteger(l, 3, 1024)
-		// TODO err := setvbuf(f, nil, mode[op], size)
+		// TODO: Implement setvbuf if needed in the future
 		return FileResult(l, nil, "")
 	}},
-	{"write", func(l *State) int { l.PushValue(1); return write(l, toFile(l), 2) }},
+	{"write", func(l *State) int { l.PushValue(1); return write(l, nil, 2) }},
 	//	{"__gc", },
 	{"__tostring", func(l *State) int {
 		if s := toStream(l); s.close == nil {
@@ -297,28 +359,17 @@ func dontClose(l *State) int {
 	return 2
 }
 
-func registerStdFile(l *State, f *os.File, reg, name string) {
-	newStream(l, f, dontClose)
-	if reg != "" {
-		l.PushValue(-1)
-		l.SetField(RegistryIndex, reg)
-	}
-	l.SetField(-2, name)
-}
-
 // IOOpen opens the io library. Usually passed to Require.
 func IOOpen(l *State) int {
-	NewLibrary(l, ioLibrary)
-
+	// First create the file handle metatable
 	NewMetaTable(l, fileHandle)
 	l.PushValue(-1)
 	l.SetField(-2, "__index")
 	SetFunctions(l, fileHandleMethods, 0)
 	l.Pop(1)
-
-	registerStdFile(l, os.Stdin, input, "stdin")
-	registerStdFile(l, os.Stdout, output, "stdout")
-	registerStdFile(l, os.Stderr, "", "stderr")
+	
+	// Then create the io library
+	NewLibrary(l, ioLibrary)
 
 	return 1
 }

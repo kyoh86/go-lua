@@ -458,3 +458,25 @@ func TestLocIsCorrectOnError(t *testing.T) {
 		}
 	}
 }
+
+func TestIOPopenRead(t *testing.T) {
+	s := `
+	local f = io.popen("echo popen_read_test", "r")
+	assert(f ~= nil, "io.popen returned nil")
+	local out = f:read("*a")
+	f:close()
+	assert(out:find("popen_read_test"), "output did not contain expected string")
+	`
+	testString(t, s)
+}
+
+func TestIOPopenWrite(t *testing.T) {
+	s := `
+	local f = io.popen("cat", "w")
+	assert(f ~= nil, "io.popen returned nil")
+	f:write("popen_write_test\n")
+	f:close()
+	-- In write mode, read is not available, so just check that no error occurs
+	`
+	testString(t, s)
+}
